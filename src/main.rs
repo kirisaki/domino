@@ -25,6 +25,7 @@ struct AppState {
     consumer_secret: String,
     auth_url: String,
     token_url: String,
+    access_url: String,
     redirect_url: String,
     callback_url: String,
 }
@@ -101,13 +102,13 @@ fn get_request_header(endpoint: &str, oauth_consumer_key: &str, oauth_consumer_s
 async fn login(data: web::Data<AppState>) -> HttpResponse {
     let header_auth = get_request_header(&data.token_url, &data.consumer_key, &data.consumer_secret, &data.callback_url);
     let client = awc::Client::default();
-    let mut body = std::collections::BTreeMap::new();
 
-    body.insert("oauth_callback", &data.callback_url);
-    let response = client
+    let mut body = std::collections::HashMap::new();
+    body.insert("oauth_callback", data.callback_url.clone());
+    let response0 = client
         .post(&data.token_url)
         .header("Authorization", header_auth)
-        .header("Content-Type", "application/x-www-form-urlencoded")
+        .content_type("application/x-www-form-urlencoded")
         .send_form(&body)
         .await
         .unwrap()
@@ -115,20 +116,14 @@ async fn login(data: web::Data<AppState>) -> HttpResponse {
         .await
         .unwrap();
 
-    let tokens: Vec<&str> = (std::str::from_utf8(&response).unwrap())
+    let tokens: Vec<&str> = (std::str::from_utf8(&response0).unwrap())
         .split('&')
         .map(|s| s.split('=').collect::<Vec<&str>>()[1])
         .collect();
 
-    let token = RequestToken{
-        oauth_token: tokens[0].to_string(),
-        oauth_token_secret: tokens[1].to_string(),
-        oauth_callback_confirmed: tokens[2].to_string(),
-    };
-
-    println!("Received: {:?}", token);
-
-    HttpResponse::Ok().body("nyaan")
+    HttpResponse::Found()
+        .header(header::LOCATION, format!("{}?oauth_token={}", data.auth_url, tokens[0]))
+        .finish()
 }
 
 fn logout(session: Session) -> HttpResponse {
@@ -140,30 +135,40 @@ fn logout(session: Session) -> HttpResponse {
 
 #[derive(Deserialize)]
 pub struct AuthRequest {
-    code: String,
-    state: String,
+    oauth_token: String,
+    oauth_verifier: String,
 }
 
-fn auth(
+async fn oauth_callback(
     session: Session,
     data: web::Data<AppState>,
     params: web::Query<AuthRequest>,
 ) -> HttpResponse {
 
     session.set("login", true).unwrap();
+    let client = awc::Client::default();
+
+    let mut body = std::collections::HashMap::new();
+    body.insert("oauth_token", &params.oauth_token);
+    body.insert("oauth_verifier", &params.oauth_verifier);
+    let response = client
+        .post(&data.access_url)
+        .content_type("application/x-www-form-urlencoded")
+        .send_form(&body)
+        .await
+        .unwrap()
+        .body()
+        .await
+        .unwrap();
 
     let html = format!(
         r#"<html>
         <head><title>Domino</title></head>
         <body>
-            Twitter returned the following state:
-            <pre>{}</pre>
-            Twitter returned the following token:
-            <pre>{:?}</pre>
+            {:?}
         </body>
     </html>"#,
-        "",
-        ""
+       response
     );
     HttpResponse::Ok().body(html)
 }
@@ -199,6 +204,7 @@ async fn main() {
             consumer_key: consume_key,
             consumer_secret: consumer_secret,
             auth_url: "https://api.twitter.com/oauth/authorize".to_string(),
+            access_url: "https://api.twitter.com/oauth/access_token".to_string(),
             token_url: "https://api.twitter.com/oauth/request_token".to_string(),
             redirect_url: "https://kirisaki.ngrok.io".to_string(),
             callback_url: "https://kirisaki.ngrok.io/oauth_callback".to_string(),
@@ -210,7 +216,7 @@ async fn main() {
             .route("/", web::get().to(index))
             .route("/login", web::get().to(login))
             .route("/logout", web::get().to(logout))
-            .route("/oauth_callback", web::get().to(auth))
+            .route("/oauth_callback", web::get().to(oauth_callback))
     })
     .bind("127.0.0.1:8000")
     .expect("Can not bind to port 8000")
